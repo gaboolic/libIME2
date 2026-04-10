@@ -54,6 +54,7 @@ class TextService:
         ComInterface<ITfTextEditSink>,
         ComInterface<ITfKeyEventSink>,
         ComInterface<ITfCompositionSink>,
+        ComInterface<ITfThreadFocusSink>,
         ComInterface<ITfCompartmentEventSink>,
         ComInterface<ITfLangBarEventSink>,
         ComInterface<ITfActiveLanguageProfileNotifySink>
@@ -166,6 +167,8 @@ public:
 
     virtual void onSetFocus();
     virtual void onKillFocus();
+    virtual void onSetThreadFocus();
+    virtual void onKillThreadFocus();
 
     virtual bool filterKeyDown(KeyEvent& keyEvent);
     virtual bool onKeyDown(KeyEvent& keyEvent, EditSession* session);
@@ -231,6 +234,10 @@ public:
     STDMETHODIMP OnKeyUp(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten) override;
     STDMETHODIMP OnPreservedKey(ITfContext *pContext, REFGUID rguid, BOOL *pfEaten) override;
 
+    // ITfThreadFocusSink
+    STDMETHODIMP OnSetThreadFocus() override;
+    STDMETHODIMP OnKillThreadFocus() override;
+
     // ITfCompositionSink
     STDMETHODIMP OnCompositionTerminated(TfEditCookie ecWrite, ITfComposition *pComposition) override;
 
@@ -272,12 +279,15 @@ private:
     TfClientId clientId_;
     DWORD activateFlags_;
     bool isKeyboardOpened_;
+    bool testKeyDownPending_;
+    bool testKeyUpPending_;
 
     // event sink cookies
     SinkAdvice threadMgrEventSink_;
     SinkAdvice activateLanguageProfileNotifySink_;
     SinkAdvice keyboardOPenCloseSink_;
     SinkAdvice textEditSink_;
+    SinkAdvice threadFocusSink_;
     DWORD langBarSinkCookie_;
 
     ComPtr<ITfComposition> composition_; // acquired when starting composition, released when ending composition

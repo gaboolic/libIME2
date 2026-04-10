@@ -57,7 +57,7 @@ public:
 
     unsigned char scanCode() const {
         // bits 16-23
-        return (unsigned char)(lParam_ & 0xff0000);
+        return (unsigned char)((lParam_ >> 16) & 0xff);
     }
 
     bool isExtended() const {

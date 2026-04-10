@@ -39,6 +39,8 @@ TextService::TextService(ImeModule* module):
     clientId_(TF_CLIENTID_NULL),
     activateFlags_(0),
     isKeyboardOpened_(false),
+    testKeyDownPending_(false),
+    testKeyUpPending_(false),
     langBarSinkCookie_(TF_INVALID_COOKIE) {
 
 }
@@ -459,6 +461,14 @@ void TextService::onSetFocus() {
 void TextService::onKillFocus() {
 }
 
+// virtual
+void TextService::onSetThreadFocus() {
+}
+
+// virtual
+void TextService::onKillThreadFocus() {
+}
+
 bool TextService::onCommand(UINT id, CommandType type) {
     return false;
 }
@@ -516,6 +526,7 @@ void TextService::installEventListeners() {
         threadMgrEventSink_ = SinkAdvice{ source, IID_ITfThreadMgrEventSink, static_cast<ITfThreadMgrEventSink*>(this) };
         activateLanguageProfileNotifySink_ = SinkAdvice{ source, IID_ITfActiveLanguageProfileNotifySink, static_cast<ITfActiveLanguageProfileNotifySink*>(this) };
         textEditSink_ = SinkAdvice{ source, IID_ITfTextEditSink, static_cast<ITfTextEditSink*>(this) };
+        threadFocusSink_ = SinkAdvice{ source, IID_ITfThreadFocusSink, static_cast<ITfThreadFocusSink*>(this) };
     }
 
     // ITfKeyEventSink
@@ -539,6 +550,7 @@ void TextService::uninstallEventListeners() {
     threadMgrEventSink_.unadvise();
     activateLanguageProfileNotifySink_.unadvise();
     textEditSink_.unadvise();
+    threadFocusSink_.unadvise();
 
     // ITfKeyEventSink
     if (auto keystrokeMgr = threadMgr_.query<ITfKeystrokeMgr>()) {
@@ -715,19 +727,42 @@ STDMETHODIMP TextService::OnSetFocus(BOOL fForeground) {
 }
 
 STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten) {
+    testKeyUpPending_ = false;
+    if (testKeyDownPending_) {
+        *pfEaten = TRUE;
+        return S_OK;
+    }
     if (isKeyboardDisabled(pContext) || !isKeyboardOpened()) {
         *pfEaten = FALSE;
     }
     else {
         KeyEvent keyEvent(WM_KEYDOWN, wParam, lParam);
         *pfEaten = (BOOL)filterKeyDown(keyEvent);
+        if (*pfEaten) {
+            HRESULT sessionResult;
+            // Some hosts only deliver OnTestKeyDown, so process the key here too.
+            auto session = ComPtr<EditSession>::make(
+                pContext,
+                [&](EditSession* session, TfEditCookie cookie) {
+                    *pfEaten = onKeyDown(keyEvent, session);
+                }
+            );
+            pContext->RequestEditSession(clientId_, session, TF_ES_SYNC | TF_ES_READWRITE, &sessionResult);
+        }
+    }
+    if (*pfEaten) {
+        testKeyDownPending_ = true;
     }
     return S_OK;
 }
 
 STDMETHODIMP TextService::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten) {
-    // Some applications do not trigger OnTestKeyDown()
-    // So we need to test it again here! Windows TSF sucks!
+    testKeyUpPending_ = false;
+    if (testKeyDownPending_) {
+        testKeyDownPending_ = false;
+        *pfEaten = TRUE;
+        return S_OK;
+    }
     if (isKeyboardDisabled(pContext) || !isKeyboardOpened()) {
         *pfEaten = FALSE;
     }
@@ -756,19 +791,42 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM 
 }
 
 STDMETHODIMP TextService::OnTestKeyUp(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten) {
+    testKeyDownPending_ = false;
+    if (testKeyUpPending_) {
+        *pfEaten = TRUE;
+        return S_OK;
+    }
     if (isKeyboardDisabled(pContext) || !isKeyboardOpened()) {
         *pfEaten = FALSE;
     }
     else {
-        KeyEvent keyEvent(WM_KEYDOWN, wParam, lParam);
+        KeyEvent keyEvent(WM_KEYUP, wParam, lParam);
         *pfEaten = (BOOL)filterKeyUp(keyEvent);
+        if (*pfEaten) {
+            HRESULT sessionResult;
+            // Mirror OnTestKeyDown for hosts that skip the real OnKeyUp callback.
+            auto session = ComPtr<EditSession>::make(
+                pContext,
+                [&](EditSession* session, TfEditCookie cookie) {
+                    *pfEaten = onKeyUp(keyEvent, session);
+                }
+            );
+            pContext->RequestEditSession(clientId_, session, TF_ES_SYNC | TF_ES_READWRITE, &sessionResult);
+        }
+    }
+    if (*pfEaten) {
+        testKeyUpPending_ = true;
     }
     return S_OK;
 }
 
 STDMETHODIMP TextService::OnKeyUp(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten) {
-    // Some applications do not trigger OnTestKeyDown()
-    // So we need to test it again here! Windows TSF sucks!
+    testKeyDownPending_ = false;
+    if (testKeyUpPending_) {
+        testKeyUpPending_ = false;
+        *pfEaten = TRUE;
+        return S_OK;
+    }
     if (isKeyboardDisabled(pContext) || !isKeyboardOpened()) {
         *pfEaten = FALSE;
     }
@@ -791,6 +849,17 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext *pContext, WPARAM wParam, LPARAM lP
 
 STDMETHODIMP TextService::OnPreservedKey(ITfContext *pContext, REFGUID rguid, BOOL *pfEaten) {
     *pfEaten = (BOOL)onPreservedKey(rguid);
+    return S_OK;
+}
+
+// ITfThreadFocusSink
+STDMETHODIMP TextService::OnSetThreadFocus() {
+    onSetThreadFocus();
+    return S_OK;
+}
+
+STDMETHODIMP TextService::OnKillThreadFocus() {
+    onKillThreadFocus();
     return S_OK;
 }
 

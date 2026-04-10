@@ -19,7 +19,6 @@
 
 #include "ImeModule.h"
 #include <string>
-#include <algorithm>
 #include <memory>
 #include <ObjBase.h>
 #include <msctf.h>
@@ -35,6 +34,73 @@
 using namespace std;
 
 namespace Ime {
+
+namespace {
+
+HKL findKeyboardLayoutForLang(LANGID langId) {
+    HKEY hKey = NULL;
+    if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts",
+        0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return NULL;
+    }
+
+    const auto findInRange = [&](DWORD start, DWORD end, bool requireImeFile) -> HKL {
+        for (DWORD id = start; id <= end; id += 0x10000) {
+            wchar_t keyName[9] = {};
+            wsprintfW(keyName, L"%08X", id);
+            HKEY hSubKey = NULL;
+            if (::RegOpenKeyExW(hKey, keyName, 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
+                bool matches = true;
+                if (requireImeFile) {
+                    wchar_t data[64] = {};
+                    DWORD type = 0;
+                    DWORD size = sizeof(data);
+                    matches = (::RegQueryValueExW(hSubKey, L"Ime File", NULL, &type,
+                        reinterpret_cast<LPBYTE>(data), &size) == ERROR_SUCCESS) &&
+                        type == REG_SZ && data[0] != L'\0';
+                }
+                ::RegCloseKey(hSubKey);
+                if (matches) {
+                    return reinterpret_cast<HKL>(static_cast<ULONG_PTR>(id));
+                }
+            }
+        }
+        return NULL;
+    };
+
+    HKL hkl = findInRange(0xE0200000 | langId, 0xE0FF0000 | langId, true);
+    if (hkl == NULL) {
+        hkl = findInRange(0xE0200000 | langId, 0xE0FF0000 | langId, false);
+    }
+    if (hkl == NULL) {
+        hkl = findInRange(0x00000000 | langId, 0x0FFF0000 | langId, false);
+    }
+
+    ::RegCloseKey(hKey);
+    return hkl;
+}
+
+const GUID kSupportedCategories[] = {
+    GUID_TFCAT_CATEGORY_OF_TIP,
+    GUID_TFCAT_TIP_KEYBOARD,
+    GUID_TFCAT_TIPCAP_SECUREMODE,
+    GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+    GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
+    GUID_TFCAT_TIPCAP_COMLESS,
+    GUID_TFCAT_TIPCAP_WOW16,
+    GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+    GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+    GUID_TFCAT_PROP_AUDIODATA,
+    GUID_TFCAT_PROP_INKDATA,
+    GUID_TFCAT_PROPSTYLE_CUSTOM,
+    GUID_TFCAT_PROPSTYLE_STATIC,
+    GUID_TFCAT_PROPSTYLE_STATICCOMPACT,
+    GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
+    GUID_TFCAT_DISPLAYATTRIBUTEPROPERTY,
+};
+
+} // namespace
 
 // these values are not defined in older TSF SDK (windows xp)
 #ifndef TF_IPP_CAPS_IMMERSIVESUPPORT
@@ -140,28 +206,46 @@ static void loadDefaultUserRegistry(const wchar_t* defaultUserRegKey) {
 HRESULT ImeModule::registerLangProfiles(LangProfileInfo* langs, int langsCount) {
     // register the language profile
     ComPtr<ITfInputProcessorProfiles> inputProcessProfiles;
-    if(CoCreateInstance(CLSID_TF_InputProcessorProfiles, NULL, CLSCTX_INPROC_SERVER, IID_ITfInputProcessorProfiles, (void**)&inputProcessProfiles) == S_OK) {
-        for(int i = 0; i < langsCount; ++i) {
-            LangProfileInfo& lang = langs[i];
-            if(inputProcessProfiles->Register(textServiceClsid_) == S_OK) {
-                LCID lcid = LocaleNameToLCID(lang.locale.c_str(), 0);
-                if (lcid == 0 && !lang.fallbackLocale.empty()) { // the conversion fails
-                    // The new RFC4646 locale names are not well-supported in Windows 7/Vista, so
-                    // here we provide a fallback locale which uses the deprecated RFC 1766 format instead.
-                    lcid = LocaleNameToLCID(lang.fallbackLocale.c_str(), 0);
-                }
-                if (lcid != 0) {
-                    LANGID langId = LANGIDFROMLCID(lcid);
-                    if (inputProcessProfiles->AddLanguageProfile(textServiceClsid_, langId, lang.profileGuid,
-                        lang.name.c_str(), lang.name.length(), lang.iconFile.empty() ? NULL : lang.iconFile.c_str(),
-                        lang.iconFile.length(), lang.iconIndex) != S_OK) {
-                        return E_FAIL;
-                    }
-                }
-                else {
-                    return E_FAIL;
-                }
-            }
+    ComPtr<ITfInputProcessorProfileMgr> inputProcessorProfileMgr;
+    if (CoCreateInstance(CLSID_TF_InputProcessorProfiles, NULL, CLSCTX_INPROC_SERVER,
+        IID_ITfInputProcessorProfiles, (void**)&inputProcessProfiles) != S_OK ||
+        CoCreateInstance(CLSID_TF_InputProcessorProfiles, NULL, CLSCTX_INPROC_SERVER,
+        IID_ITfInputProcessorProfileMgr, (void**)&inputProcessorProfileMgr) != S_OK) {
+        return E_FAIL;
+    }
+
+    if (inputProcessProfiles->Register(textServiceClsid_) != S_OK) {
+        return E_FAIL;
+    }
+
+    for (int i = 0; i < langsCount; ++i) {
+        LangProfileInfo& lang = langs[i];
+        LCID lcid = LocaleNameToLCID(lang.locale.c_str(), 0);
+        if (lcid == 0 && !lang.fallbackLocale.empty()) { // the conversion fails
+            // The new RFC4646 locale names are not well-supported in Windows 7/Vista, so
+            // here we provide a fallback locale which uses the deprecated RFC 1766 format instead.
+            lcid = LocaleNameToLCID(lang.fallbackLocale.c_str(), 0);
+        }
+        if (lcid == 0) {
+            return E_FAIL;
+        }
+
+        const LANGID langId = LANGIDFROMLCID(lcid);
+        const HKL hkl = findKeyboardLayoutForLang(langId);
+        if (inputProcessorProfileMgr->RegisterProfile(
+            textServiceClsid_,
+            langId,
+            lang.profileGuid,
+            lang.name.c_str(),
+            static_cast<ULONG>(lang.name.length()),
+            lang.iconFile.empty() ? NULL : lang.iconFile.c_str(),
+            static_cast<ULONG>(lang.iconFile.length()),
+            lang.iconIndex,
+            hkl,
+            0,
+            TRUE,
+            0) != S_OK) {
+            return E_FAIL;
         }
     }
 
@@ -296,37 +380,15 @@ HRESULT ImeModule::registerServer(wchar_t* imeName, LangProfileInfo* langs, int 
     if(result == S_OK) {
         ITfCategoryMgr *categoryMgr = NULL;
         if(CoCreateInstance(CLSID_TF_CategoryMgr, NULL, CLSCTX_INPROC_SERVER, IID_ITfCategoryMgr, (void**)&categoryMgr) == S_OK) {
-            if(categoryMgr->RegisterCategory(textServiceClsid_, GUID_TFCAT_TIP_KEYBOARD, textServiceClsid_) != S_OK) {
-                result = E_FAIL;
-            }
-
-            // register ourself as a display attribute provider
-            // so later we can set change the look and feels of composition string.
-            if(categoryMgr->RegisterCategory(textServiceClsid_, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, textServiceClsid_) != S_OK) {
-                result = E_FAIL;
-            }
-
-            // enable UI less mode
-            if(categoryMgr->RegisterCategory(textServiceClsid_, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, textServiceClsid_) != S_OK ||
-                categoryMgr->RegisterCategory(textServiceClsid_, GUID_TFCAT_TIPCAP_UIELEMENTENABLED, textServiceClsid_) != S_OK) {
-                result  = E_FAIL;
-            }
-
-            if(::IsWindows8OrGreater()) {
-                // for Windows 8 store app support
-                // TODO: according to a exhaustive Google search, I found that
-                // TF_IPP_CAPS_IMMERSIVESUPPORT is required to make the IME work with Windows 8.
-                // http://social.msdn.microsoft.com/Forums/windowsapps/en-US/4c422cf1-ceb4-413b-8a7c-6881946a4c63/how-to-set-a-flag-indicating-tsf-components-compatibility
-                // Quote from the page: "To indicate that your IME is compatible with Windows Store apps, call RegisterCategory with GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT."
-
-                // declare supporting immersive mode
-                if(categoryMgr->RegisterCategory(textServiceClsid_, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, textServiceClsid_) != S_OK) {
-                    result = E_FAIL;
+            for (const auto& category : kSupportedCategories) {
+                if ((category == GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT ||
+                     category == GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT) &&
+                    !::IsWindows8OrGreater()) {
+                    continue;
                 }
-
-                // declare compatibility with Windows 8 system tray
-                if(categoryMgr->RegisterCategory(textServiceClsid_, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, textServiceClsid_) != S_OK) {
+                if (categoryMgr->RegisterCategory(textServiceClsid_, category, textServiceClsid_) != S_OK) {
                     result = E_FAIL;
+                    break;
                 }
             }
 
@@ -347,15 +409,13 @@ HRESULT ImeModule::unregisterServer() {
     // unregister categories
     ITfCategoryMgr *categoryMgr = NULL;
     if(CoCreateInstance(CLSID_TF_CategoryMgr, NULL, CLSCTX_INPROC_SERVER, IID_ITfCategoryMgr, (void**)&categoryMgr) == S_OK) {
-        categoryMgr->UnregisterCategory(textServiceClsid_, GUID_TFCAT_TIP_KEYBOARD, textServiceClsid_);
-        categoryMgr->UnregisterCategory(textServiceClsid_, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, textServiceClsid_);
-        // UI less mode
-        categoryMgr->UnregisterCategory(textServiceClsid_, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, textServiceClsid_);
-
-        if(::IsWindows8OrGreater()) {
-            // Windows 8 support
-            categoryMgr->UnregisterCategory(textServiceClsid_, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, textServiceClsid_);
-            categoryMgr->RegisterCategory(textServiceClsid_, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, textServiceClsid_);
+        for (const auto& category : kSupportedCategories) {
+            if ((category == GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT ||
+                 category == GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT) &&
+                !::IsWindows8OrGreater()) {
+                continue;
+            }
+            categoryMgr->UnregisterCategory(textServiceClsid_, category, textServiceClsid_);
         }
 
         categoryMgr->Release();
@@ -367,7 +427,7 @@ HRESULT ImeModule::unregisterServer() {
     if(StringFromCLSID(textServiceClsid_, &clsidStr) == ERROR_SUCCESS) {
         regPath += clsidStr;
         CoTaskMemFree(clsidStr);
-        ::SHDeleteKey(HKEY_CLASSES_ROOT, regPath.c_str());
+        ::SHDeleteKeyW(HKEY_CLASSES_ROOT, regPath.c_str());
     }
 
 #ifndef _WIN64  // only do this for the 32-bit version dll
