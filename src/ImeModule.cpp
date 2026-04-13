@@ -353,7 +353,7 @@ HRESULT ImeModule::registerLangProfiles(LangProfileInfo* langs, int langsCount) 
     return S_OK;
 }
 
-HRESULT ImeModule::registerServer(wchar_t* imeName, LangProfileInfo* langs, int count) {
+HRESULT ImeModule::registerServer(const wchar_t* imeName, LangProfileInfo* langs, int count) {
     // write info of our COM text service component to the registry
     // path: HKEY_CLASS_ROOT\\CLSID\\{xxxx-xxxx-xxxx-xx....}
     // This reguires Administrator permimssion to write to the registery
@@ -379,7 +379,8 @@ HRESULT ImeModule::registerServer(wchar_t* imeName, LangProfileInfo* langs, int 
     HKEY hkey = NULL;
     if(::RegCreateKeyExW(HKEY_CLASSES_ROOT, regPath.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hkey, NULL) == ERROR_SUCCESS) {
         // write name of our IME
-        ::RegSetValueExW(hkey, NULL, 0, REG_SZ, (BYTE*)imeName, sizeof(wchar_t) * (wcslen(imeName) + 1));
+        ::RegSetValueExW(hkey, NULL, 0, REG_SZ, reinterpret_cast<const BYTE*>(imeName),
+            sizeof(wchar_t) * (wcslen(imeName) + 1));
 
         HKEY inProcServer32Key;
         if(::RegCreateKeyExW(hkey, L"InprocServer32", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &inProcServer32Key, NULL) == ERROR_SUCCESS) {
