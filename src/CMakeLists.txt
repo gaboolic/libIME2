@@ -10,6 +10,8 @@ add_library(libIME2_static STATIC
     ImeModule.h
     libIME.cpp
     libIME.h
+    DebugLogConfig.cpp
+    DebugLogConfig.h
     TextService.cpp
     TextService.h
     KeyEvent.cpp

@@ -137,6 +137,7 @@ public:
     void startComposition(ITfContext* context);
     void endComposition(ITfContext* context);
     bool compositionRect(EditSession* session, RECT* rect) const;
+    bool inputRect(EditSession* session, RECT* rect) const;
     bool selectionRect(EditSession* session, RECT* rect) const;
     HWND compositionWindow(EditSession* session) const;
 
@@ -200,6 +201,14 @@ public:
 
     // called when a language profile is deactivated
     virtual void onLangProfileDeactivated(REFGUID guidProfile);
+
+    // Derived text services can override this when they render the preedit
+    // outside the application and want TSF to expose an inline composition.
+    virtual bool inlinePreeditEnabledForComposition() const;
+    // Derived text services can opt into a dummy composition anchor for
+    // hosts that otherwise fail to provide a usable GetTextExt() position.
+    virtual bool shouldUseDummyCompositionAnchor() const;
+    bool effectiveDummyCompositionAnchor() const;
 
     // COM related stuff
 public:
@@ -273,6 +282,9 @@ protected: // COM object should not be deleted directly. calling Release() inste
     virtual ~TextService(void);
 
 private:
+    bool ensureDummyCompositionAnchor(EditSession* session, const wchar_t* reason) const;
+
+private:
     ComPtr<ImeModule> module_;
     ComPtr<ITfDisplayAttributeProvider> displayAttributeProvider_;
     ComPtr<ITfThreadMgr> threadMgr_;
@@ -291,6 +303,8 @@ private:
     DWORD langBarSinkCookie_;
 
     ComPtr<ITfComposition> composition_; // acquired when starting composition, released when ending composition
+    mutable bool dummyCompositionActive_;
+    mutable bool autoDummyCompositionAnchorEnabled_;
     ComPtr<ITfLangBarMgr> langBarMgr_;
     std::vector<ComPtr<LangBarButton>> langBarButtons_;
     std::vector<PreservedKey> preservedKeys_;

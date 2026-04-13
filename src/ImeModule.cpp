@@ -231,7 +231,13 @@ HRESULT ImeModule::registerLangProfiles(LangProfileInfo* langs, int langsCount) 
         }
 
         const LANGID langId = LANGIDFROMLCID(lcid);
-        const HKL hkl = findKeyboardLayoutForLang(langId);
+        // This is a TSF-only build. Registering a profile against an arbitrary
+        // keyboard layout/HKL causes Windows to emit SubstituteLayout for the
+        // TIP, which can make hosts switch to the fallback layout instead of
+        // activating this text service. Only register an HKL when the TIP owns
+        // a real IMM keyboard layout; otherwise leave it null like Weasel's
+        // TSF-only path.
+        const HKL hkl = NULL;
         if (inputProcessorProfileMgr->RegisterProfile(
             textServiceClsid_,
             langId,
@@ -245,6 +251,26 @@ HRESULT ImeModule::registerLangProfiles(LangProfileInfo* langs, int langsCount) 
             0,
             TRUE,
             0) != S_OK) {
+            return E_FAIL;
+        }
+
+        // Match Weasel's install flow: after registering the TIP profile,
+        // explicitly enable it for the current user and mark it enabled by
+        // default. Some hosts only deliver key events once the per-user enable
+        // state has been written under HKCU.
+        if (inputProcessProfiles->EnableLanguageProfile(
+            textServiceClsid_,
+            langId,
+            lang.profileGuid,
+            TRUE) != S_OK) {
+            return E_FAIL;
+        }
+
+        if (inputProcessProfiles->EnableLanguageProfileByDefault(
+            textServiceClsid_,
+            langId,
+            lang.profileGuid,
+            TRUE) != S_OK) {
             return E_FAIL;
         }
     }

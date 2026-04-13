@@ -18,6 +18,7 @@
 //
 
 #include "TextService.h"
+#include "DebugLogConfig.h"
 #include "EditSession.h"
 #include "CandidateWindow.h"
 #include "LangBarButton.h"
@@ -25,12 +26,188 @@
 #include "ImeModule.h"
 
 #include <assert.h>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <algorithm>
 
 using namespace std;
 
 namespace Ime {
+
+namespace {
+
+constexpr wchar_t kDummyAnchorText[] = L"\x200B";
+
+std::wstring timestampNow() {
+    SYSTEMTIME st{};
+    ::GetLocalTime(&st);
+    wchar_t buffer[64] = {0};
+    _snwprintf_s(buffer, _countof(buffer), _TRUNCATE,
+        L"%04u-%02u-%02u %02u:%02u:%02u.%03u",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    return buffer;
+}
+
+void appendTextServiceDebugLog(const std::wstring& message) {
+    if (!isDebugLoggingEnabled()) {
+        return;
+    }
+
+    const wchar_t* localAppData = _wgetenv(L"LOCALAPPDATA");
+    if (!localAppData || !*localAppData) {
+        return;
+    }
+
+    std::wstring logDir = std::wstring(localAppData) + L"\\MoqiIM\\Log";
+    ::CreateDirectoryW((std::wstring(localAppData) + L"\\MoqiIM").c_str(), nullptr);
+    ::CreateDirectoryW(logDir.c_str(), nullptr);
+    std::wstring logPath = logDir + L"\\tsf-debug.log";
+
+    std::wofstream stream(logPath, std::ios::app);
+    if (!stream.is_open()) {
+        return;
+    }
+    stream << message << L"\n";
+}
+
+void logTextServiceDebug(const std::wstring& message) {
+    std::wostringstream line;
+    line << L"[" << timestampNow() << L"]"
+         << L"[pid=" << ::GetCurrentProcessId() << L"]"
+         << L"[tid=" << ::GetCurrentThreadId() << L"] "
+         << message;
+    const std::wstring formatted = line.str();
+    ::OutputDebugStringW((formatted + L"\n").c_str());
+    appendTextServiceDebugLog(formatted);
+}
+
+std::wstring boolText(bool value) {
+    return value ? L"true" : L"false";
+}
+
+std::wstring rectToString(const RECT& rect) {
+    std::wostringstream stream;
+    stream << L"(" << rect.left << L"," << rect.top << L"," << rect.right << L"," << rect.bottom << L")";
+    return stream.str();
+}
+
+bool tryAdjustRectWithForegroundCaret(RECT* rect) {
+    if (!rect) {
+        return false;
+    }
+
+    const HWND foregroundWindow = ::GetForegroundWindow();
+    if (!foregroundWindow) {
+        return false;
+    }
+
+    RECT foregroundRect = {};
+    if (!::GetWindowRect(foregroundWindow, &foregroundRect)) {
+        return false;
+    }
+
+    if (rect->left >= foregroundRect.left && rect->left <= foregroundRect.right &&
+        rect->top >= foregroundRect.top && rect->top <= foregroundRect.bottom) {
+        return false;
+    }
+
+    POINT caret = {};
+    const bool hasCaret = ::GetCaretPos(&caret) != FALSE;
+    const int offsetX = foregroundRect.left - rect->left + (hasCaret ? caret.x : 0);
+    const int offsetY = foregroundRect.top - rect->top + (hasCaret ? caret.y : 0);
+    ::OffsetRect(rect, offsetX, offsetY);
+    return true;
+}
+
+bool getRawTextExtRect(ITfContext* context, TfEditCookie editCookie, ITfRange* range, RECT* rect) {
+    if (!context || !range || !rect) {
+        return false;
+    }
+
+    ComPtr<ITfContextView> view;
+    if (context->GetActiveView(&view) != S_OK) {
+        return false;
+    }
+
+    BOOL clipped = FALSE;
+    if (view->GetTextExt(editCookie, range, rect, &clipped) != S_OK) {
+        return false;
+    }
+    return true;
+}
+
+bool getTextExtRect(ITfContext* context, TfEditCookie editCookie, ITfRange* range, RECT* rect) {
+    if (!getRawTextExtRect(context, editCookie, range, rect)) {
+        return false;
+    }
+
+    // Some fullscreen/game hosts report coordinates relative to the foreground
+    // window instead of screen coordinates. Follow Weasel and correct them using
+    // the foreground window origin and caret position when the rect is clearly out
+    // of bounds.
+    tryAdjustRectWithForegroundCaret(rect);
+    return true;
+}
+
+bool getForegroundWindowRect(RECT* rect) {
+    if (!rect) {
+        return false;
+    }
+
+    const HWND foregroundWindow = ::GetForegroundWindow();
+    return foregroundWindow && ::GetWindowRect(foregroundWindow, rect);
+}
+
+int absoluteDiff(int lhs, int rhs) {
+    return lhs > rhs ? lhs - rhs : rhs - lhs;
+}
+
+int inputRectScore(const RECT& rect, const RECT* foregroundRect, bool preferSelection) {
+    int score = preferSelection ? 1 : 0;
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+
+    if (width < 0 || height < 0) {
+        score -= 100;
+    } else {
+        if (width == 0) {
+            score -= 10;
+        }
+        if (height == 0) {
+            score -= 30;
+        } else if (height < 8) {
+            score -= 10;
+        }
+    }
+
+    if (!foregroundRect) {
+        return score;
+    }
+
+    const bool insideForeground =
+        rect.left >= foregroundRect->left && rect.left <= foregroundRect->right &&
+        rect.top >= foregroundRect->top && rect.top <= foregroundRect->bottom;
+    if (insideForeground) {
+        score += 40;
+    } else {
+        score -= 20;
+    }
+
+    const bool tinyTopLeftMarker =
+        absoluteDiff(rect.left, foregroundRect->left) <= 48 &&
+        absoluteDiff(rect.top, foregroundRect->top) <= 48 &&
+        width <= 4 &&
+        height > 0 && height <= 48;
+    if (tinyTopLeftMarker) {
+        score -= 80;
+    }
+
+    return score;
+}
+
+} // namespace
 
 TextService::TextService(ImeModule* module):
     module_(module),
@@ -41,6 +218,8 @@ TextService::TextService(ImeModule* module):
     isKeyboardOpened_(false),
     testKeyDownPending_(false),
     testKeyUpPending_(false),
+    dummyCompositionActive_(false),
+    autoDummyCompositionAnchorEnabled_(false),
     langBarSinkCookie_(TF_INVALID_COOKIE) {
 
 }
@@ -176,6 +355,8 @@ void TextService::startComposition(ITfContext* context) {
         context,
         [=](EditSession* session, TfEditCookie cookie) {
             if (auto contextComposition = ComPtr<ITfContextComposition>::queryFrom(context)) {
+                const bool inlinePreeditEnabled = inlinePreeditEnabledForComposition();
+                const bool useDummyAnchor = effectiveDummyCompositionAnchor();
                 // get current insertion point in the current context
                 ComPtr<ITfRange> range;
                 if (auto insertAtSelection = ComPtr<ITfInsertAtSelection>::queryFrom(context)) {
@@ -185,14 +366,48 @@ void TextService::startComposition(ITfContext* context) {
 
                 if (range) {
                     composition_ = nullptr;
+                    dummyCompositionActive_ = false;
                     if (contextComposition->StartComposition(cookie, range, (ITfCompositionSink*)this, &composition_) == S_OK) {
+                        ComPtr<ITfRange> compositionRange;
+                        if (composition_->GetRange(&compositionRange) != S_OK) {
+                            compositionRange = range;
+                        }
+
+                        if (useDummyAnchor && compositionRange) {
+                            // Some CUAS-backed hosts do not provide a useful
+                            // GetTextExt() anchor until the composition contains
+                            // at least one character. Use an actual zero-width
+                            // space so the host gets an anchor without showing a
+                            // visible placeholder in the app.
+                            if (compositionRange->SetText(
+                                    cookie, TF_ST_CORRECTION, kDummyAnchorText, 1) == S_OK) {
+                                dummyCompositionActive_ = true;
+                                logTextServiceDebug(
+                                    L"[startComposition] enabled zero-width dummy anchor");
+                            }
+                        }
+
                         // according to the official TSF samples, we need to reset the current
                         // selection here. (maybe the range is altered by StartComposition()?
                         TF_SELECTION selection;
-                        selection.range = range;
+                        if (compositionRange) {
+                            if (inlinePreeditEnabled) {
+                                compositionRange->Collapse(cookie, TF_ANCHOR_END);
+                            } else {
+                                compositionRange->Collapse(cookie, TF_ANCHOR_START);
+                            }
+                            selection.range = compositionRange;
+                        } else {
+                            selection.range = range;
+                        }
                         selection.style.ase = TF_AE_NONE;
                         selection.style.fInterimChar = FALSE;
                         context->SetSelection(cookie, 1, &selection);
+                        logTextServiceDebug(
+                            L"[startComposition] started dummy_anchor=" +
+                            boolText(dummyCompositionActive_) +
+                            L" inline_preedit=" + boolText(inlinePreeditEnabled) +
+                            L" dummy_requested=" + boolText(useDummyAnchor));
                     }
                 }
             }
@@ -211,6 +426,12 @@ void TextService::endComposition(ITfContext* context) {
                 // move current insertion point to end of the composition string
                 ComPtr<ITfRange> compositionRange;
                 if (composition_->GetRange(&compositionRange) == S_OK) {
+                    if (dummyCompositionActive_) {
+                        logTextServiceDebug(L"[endComposition] clearing dummy anchor");
+                        compositionRange->SetText(cookie, 0, L"", 0);
+                        dummyCompositionActive_ = false;
+                    }
+
                     // clear display attribute for the composition range
                     ComPtr<ITfProperty> dispAttrProp;
                     if (context->GetProperty(GUID_PROP_ATTRIBUTE, &dispAttrProp) == S_OK) {
@@ -231,6 +452,8 @@ void TextService::endComposition(ITfContext* context) {
                 // do some cleanup in the derived class here
                 onCompositionTerminated(false);
                 composition_ = nullptr;
+                dummyCompositionActive_ = false;
+                logTextServiceDebug(L"[endComposition] ended dummy_anchor=false");
             }
         }
     );
@@ -239,6 +462,9 @@ void TextService::endComposition(ITfContext* context) {
 
 std::wstring TextService::compositionString(EditSession* session) const {
     std::wstring result;
+    if (dummyCompositionActive_) {
+        return result;
+    }
     if (composition_) {
         ComPtr<ITfRange> compositionRange;
         if (composition_->GetRange(&compositionRange) == S_OK) {
@@ -272,12 +498,26 @@ void TextService::setCompositionString(EditSession* session, const wchar_t* str,
                 bool selPosInComposition = true;
                 // if current insertion point is not covered by composition, we cannot insert text here.
                 if(selPosInComposition) {
+                    const bool preserveDummyAnchor =
+                        dummyCompositionActive_ && effectiveDummyCompositionAnchor() && len == 0;
+
                     // replace context of composion area with the new string.
-                    compositionRange->SetText(editCookie, TF_ST_CORRECTION, str, len);
+                    if (!preserveDummyAnchor) {
+                        compositionRange->SetText(editCookie, TF_ST_CORRECTION, str, len);
+                        dummyCompositionActive_ = false;
+                        logTextServiceDebug(
+                            L"[setCompositionString] updated len=" + std::to_wstring(len) +
+                            L" dummy_anchor=false");
+                    } else {
+                        logTextServiceDebug(
+                            L"[setCompositionString] preserved zero-width dummy anchor");
+                    }
 
                     // move the insertion point to end of the composition string
-                    selection.range->Collapse(editCookie, TF_ANCHOR_END);
-                    context->SetSelection(editCookie, 1, &selection);
+                    if (!preserveDummyAnchor) {
+                        selection.range->Collapse(editCookie, TF_ANCHOR_END);
+                        context->SetSelection(editCookie, 1, &selection);
+                    }
                 }
 
                 // set display attribute to the composition range
@@ -292,6 +532,73 @@ void TextService::setCompositionString(EditSession* session, const wchar_t* str,
             selection.range->Release();
         }
     }
+}
+
+bool TextService::inlinePreeditEnabledForComposition() const {
+    return true;
+}
+
+bool TextService::shouldUseDummyCompositionAnchor() const {
+    return false;
+}
+
+bool TextService::effectiveDummyCompositionAnchor() const {
+    return dummyCompositionActive_ || autoDummyCompositionAnchorEnabled_ || shouldUseDummyCompositionAnchor();
+}
+
+bool TextService::ensureDummyCompositionAnchor(EditSession* session, const wchar_t* reason) const {
+    if (!session || !composition_ || dummyCompositionActive_) {
+        return false;
+    }
+
+    ComPtr<ITfRange> compositionRange;
+    if (composition_->GetRange(&compositionRange) != S_OK || !compositionRange) {
+        return false;
+    }
+
+    bool hasVisibleCompositionText = false;
+    if (auto rangeAcp = compositionRange.query<ITfRangeACP>()) {
+        LONG anchor = 0;
+        LONG textLen = 0;
+        if (rangeAcp->GetExtent(&anchor, &textLen) == S_OK) {
+            hasVisibleCompositionText = textLen > 0;
+        }
+    }
+    if (!hasVisibleCompositionText) {
+        wchar_t buf[2] = {};
+        ULONG textLen = 0;
+        if (compositionRange->GetText(session->editCookie(), 0, buf, 1, &textLen) == S_OK) {
+            hasVisibleCompositionText = textLen > 0;
+        }
+    }
+    if (hasVisibleCompositionText) {
+        return false;
+    }
+
+    if (compositionRange->SetText(session->editCookie(), TF_ST_CORRECTION, kDummyAnchorText, 1) != S_OK) {
+        return false;
+    }
+
+    dummyCompositionActive_ = true;
+    autoDummyCompositionAnchorEnabled_ = true;
+
+    TF_SELECTION selection;
+    if (inlinePreeditEnabledForComposition()) {
+        compositionRange->Collapse(session->editCookie(), TF_ANCHOR_END);
+    }
+    else {
+        compositionRange->Collapse(session->editCookie(), TF_ANCHOR_START);
+    }
+    selection.range = compositionRange;
+    selection.style.ase = TF_AE_NONE;
+    selection.style.fInterimChar = FALSE;
+    session->context()->SetSelection(session->editCookie(), 1, &selection);
+
+    logTextServiceDebug(
+        L"[dummyAnchor] auto-enabled reason=" +
+        std::wstring(reason ? reason : L"unknown") +
+        L" inline_preedit=" + boolText(inlinePreeditEnabledForComposition()));
+    return true;
 }
 
 // set cursor position in the composition area
@@ -600,21 +907,7 @@ void TextService::deactivateLanguageButtons() {
 
 // ITfTextInputProcessor
 STDMETHODIMP TextService::Activate(ITfThreadMgr *pThreadMgr, TfClientId tfClientId) {
-    // store tsf manager & client id
-    threadMgr_ = pThreadMgr;
-    clientId_ = tfClientId;
-
-    activateFlags_ = 0;
-    if(auto threadMgrEx = threadMgr_.query<ITfThreadMgrEx>()) {
-        threadMgrEx->GetActiveFlags(&activateFlags_);
-    }
-
-    installEventListeners();
-    initKeyboardState();
-    activateLanguageButtons();
-
-    onActivate();
-    return S_OK;
+    return ActivateEx(pThreadMgr, tfClientId, 0);
 }
 
 STDMETHODIMP TextService::Deactivate() {
@@ -638,7 +931,22 @@ STDMETHODIMP TextService::Deactivate() {
 
 // ITfTextInputProcessorEx
 STDMETHODIMP TextService::ActivateEx(ITfThreadMgr *ptim, TfClientId tid, DWORD dwFlags) {
-    Activate(ptim, tid);
+    // store tsf manager & client id
+    threadMgr_ = ptim;
+    clientId_ = tid;
+
+    activateFlags_ = dwFlags;
+    if (activateFlags_ == 0) {
+        if(auto threadMgrEx = threadMgr_.query<ITfThreadMgrEx>()) {
+            threadMgrEx->GetActiveFlags(&activateFlags_);
+        }
+    }
+
+    installEventListeners();
+    initKeyboardState();
+    activateLanguageButtons();
+
+    onActivate();
     return S_OK;
 }
 
@@ -873,6 +1181,8 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite, ITfCompo
     // this event is not triggered.
     onCompositionTerminated(true);
     composition_ = nullptr;
+    dummyCompositionActive_ = false;
+    logTextServiceDebug(L"[OnCompositionTerminated] forced termination dummy_anchor=false");
     return S_OK;
 }
 
@@ -948,32 +1258,121 @@ ComPtr<ITfContext> TextService::currentContext() const {
 bool TextService::compositionRect(EditSession* session, RECT* rect) const {
     bool ret = false;
     if(isComposing()) {
-        ComPtr<ITfContextView> view;
-        if(session->context()->GetActiveView(&view) == S_OK) {
-            BOOL clipped;
-            ComPtr<ITfRange> range;
-            if(composition_->GetRange(&range) == S_OK) {
-                if(view->GetTextExt(session->editCookie(), range, rect, &clipped) == S_OK)
-                    ret = true;
-            }
+        ComPtr<ITfRange> range;
+        if(composition_->GetRange(&range) == S_OK) {
+            ret = getTextExtRect(session->context(), session->editCookie(), range, rect);
         }
     }
     return ret;
 }
 
+bool TextService::inputRect(EditSession* session, RECT* rect) const {
+    if (!session || !rect) {
+        return false;
+    }
+
+    RECT foregroundRect = {};
+    const RECT* foregroundRectPtr = getForegroundWindowRect(&foregroundRect) ? &foregroundRect : nullptr;
+    struct InputRectSnapshot {
+        RECT compositionStartRect{};
+        bool hasCompositionStartRect = false;
+        RECT selectionRectValue{};
+        bool hasSelectionRectValue = false;
+        int compositionScore = -1000;
+        int selectionScore = -1000;
+    };
+
+    auto collectSnapshot = [&](InputRectSnapshot* snapshot) {
+        snapshot->hasCompositionStartRect = false;
+        snapshot->hasSelectionRectValue = false;
+        snapshot->compositionScore = -1000;
+        snapshot->selectionScore = -1000;
+
+        if (isComposing()) {
+            ComPtr<ITfRange> compositionRange;
+            if (composition_->GetRange(&compositionRange) == S_OK) {
+                compositionRange->Collapse(session->editCookie(), TF_ANCHOR_START);
+                snapshot->hasCompositionStartRect = getRawTextExtRect(
+                    session->context(), session->editCookie(), compositionRange, &snapshot->compositionStartRect);
+            }
+        }
+
+        TF_SELECTION selection;
+        ULONG selectionNum;
+        if(session->context()->GetSelection(session->editCookie(), TF_DEFAULT_SELECTION, 1, &selection, &selectionNum) == S_OK ) {
+            snapshot->hasSelectionRectValue = getRawTextExtRect(
+                session->context(), session->editCookie(), selection.range, &snapshot->selectionRectValue);
+            selection.range->Release();
+        } else {
+            logTextServiceDebug(
+                L"[inputRect] GetSelection failed dummy_anchor=" + boolText(dummyCompositionActive_));
+        }
+
+        if (snapshot->hasCompositionStartRect) {
+            snapshot->compositionScore = inputRectScore(
+                snapshot->compositionStartRect, foregroundRectPtr, false);
+        }
+        if (snapshot->hasSelectionRectValue) {
+            snapshot->selectionScore = inputRectScore(
+                snapshot->selectionRectValue, foregroundRectPtr, true);
+        }
+    };
+
+    InputRectSnapshot snapshot;
+    collectSnapshot(&snapshot);
+
+    const auto bestScore = [&]() {
+        return (std::max)(snapshot.compositionScore, snapshot.selectionScore);
+    };
+
+    if ((!snapshot.hasCompositionStartRect && !snapshot.hasSelectionRectValue) ||
+        bestScore() < 0) {
+        const wchar_t* reason =
+            (!snapshot.hasCompositionStartRect && !snapshot.hasSelectionRectValue)
+            ? L"missing_rect"
+            : L"bad_rect";
+        if (ensureDummyCompositionAnchor(session, reason)) {
+            collectSnapshot(&snapshot);
+        }
+    }
+
+    if (!snapshot.hasCompositionStartRect && !snapshot.hasSelectionRectValue) {
+        logTextServiceDebug(
+            L"[inputRect] failed dummy_anchor=" + boolText(dummyCompositionActive_) +
+            L" auto_dummy=" + boolText(autoDummyCompositionAnchorEnabled_) +
+            L" composition_start=false selection=false");
+        return false;
+    }
+
+    const bool chooseSelection =
+        snapshot.hasSelectionRectValue &&
+        (!snapshot.hasCompositionStartRect || snapshot.selectionScore >= snapshot.compositionScore);
+    *rect = chooseSelection ? snapshot.selectionRectValue : snapshot.compositionStartRect;
+    const bool adjusted = tryAdjustRectWithForegroundCaret(rect);
+
+    logTextServiceDebug(
+        L"[inputRect] source=" + std::wstring(chooseSelection ? L"selection" : L"composition-start") +
+        L" dummy_anchor=" + boolText(dummyCompositionActive_) +
+        L" auto_dummy=" + boolText(autoDummyCompositionAnchorEnabled_) +
+        L" composition_start=" +
+        (snapshot.hasCompositionStartRect ? rectToString(snapshot.compositionStartRect) : std::wstring(L"<none>")) +
+        L" selection=" +
+        (snapshot.hasSelectionRectValue ? rectToString(snapshot.selectionRectValue) : std::wstring(L"<none>")) +
+        L" composition_score=" + std::to_wstring(snapshot.compositionScore) +
+        L" selection_score=" + std::to_wstring(snapshot.selectionScore) +
+        L" adjusted=" + boolText(adjusted) +
+        L" final=" + rectToString(*rect));
+    return true;
+}
+
 bool TextService::selectionRect(EditSession* session, RECT* rect) const {
     bool ret = false;
     if(isComposing()) {
-        ComPtr<ITfContextView> view;
-        if(session->context()->GetActiveView(&view) == S_OK) {
-            BOOL clipped;
-            TF_SELECTION selection;
-            ULONG selectionNum;
-            if(session->context()->GetSelection(session->editCookie(), TF_DEFAULT_SELECTION, 1, &selection, &selectionNum) == S_OK ) {
-                if(view->GetTextExt(session->editCookie(), selection.range, rect, &clipped) == S_OK)
-                    ret = true;
-                selection.range->Release();
-            }
+        TF_SELECTION selection;
+        ULONG selectionNum;
+        if(session->context()->GetSelection(session->editCookie(), TF_DEFAULT_SELECTION, 1, &selection, &selectionNum) == S_OK ) {
+            ret = getTextExtRect(session->context(), session->editCookie(), selection.range, rect);
+            selection.range->Release();
         }
     }
     return ret;
