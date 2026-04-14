@@ -19,6 +19,7 @@
 
 #include "TextService.h"
 #include "DebugLogConfig.h"
+#include "DebugLogFile.h"
 #include "EditSession.h"
 #include "CandidateWindow.h"
 #include "LangBarButton.h"
@@ -50,6 +51,39 @@ std::wstring timestampNow() {
     return buffer;
 }
 
+std::wstring currentProcessPath() {
+    std::wstring buffer(MAX_PATH, L'\0');
+    DWORD len = ::GetModuleFileNameW(nullptr, &buffer[0], static_cast<DWORD>(buffer.size()));
+    if (len == 0) {
+        return L"";
+    }
+    while (len >= buffer.size() - 1) {
+        buffer.resize(buffer.size() * 2);
+        len = ::GetModuleFileNameW(nullptr, &buffer[0], static_cast<DWORD>(buffer.size()));
+        if (len == 0) {
+            return L"";
+        }
+    }
+    buffer.resize(len);
+    return buffer;
+}
+
+std::wstring processBaseName(const std::wstring& imagePath) {
+    const size_t pos = imagePath.find_last_of(L"\\/");
+    return pos == std::wstring::npos ? imagePath : imagePath.substr(pos + 1);
+}
+
+std::wstring formatTextServiceDebugLogLine(const std::wstring& message) {
+    const std::wstring exeName = processBaseName(currentProcessPath());
+    std::wostringstream line;
+    line << L"[" << timestampNow() << L"]"
+         << L"[pid=" << ::GetCurrentProcessId() << L"]"
+         << L"[tid=" << ::GetCurrentThreadId() << L"]"
+         << L"[exe=" << (exeName.empty() ? L"<unknown>" : exeName) << L"] "
+         << message;
+    return line.str();
+}
+
 void appendTextServiceDebugLog(const std::wstring& message) {
     if (!isDebugLoggingEnabled()) {
         return;
@@ -61,9 +95,11 @@ void appendTextServiceDebugLog(const std::wstring& message) {
     }
 
     std::wstring logDir = std::wstring(localAppData) + L"\\MoqiIM\\Log";
-    ::CreateDirectoryW((std::wstring(localAppData) + L"\\MoqiIM").c_str(), nullptr);
-    ::CreateDirectoryW(logDir.c_str(), nullptr);
-    std::wstring logPath = logDir + L"\\tsf-debug.log";
+    std::wstring logPath = DebugLogFile::prepareDailyLogFilePath(
+        logDir, L"tsf-debug.log");
+    if (logPath.empty()) {
+        return;
+    }
 
     std::wofstream stream(logPath, std::ios::app);
     if (!stream.is_open()) {
@@ -73,12 +109,10 @@ void appendTextServiceDebugLog(const std::wstring& message) {
 }
 
 void logTextServiceDebug(const std::wstring& message) {
-    std::wostringstream line;
-    line << L"[" << timestampNow() << L"]"
-         << L"[pid=" << ::GetCurrentProcessId() << L"]"
-         << L"[tid=" << ::GetCurrentThreadId() << L"] "
-         << message;
-    const std::wstring formatted = line.str();
+    if (!isDebugLoggingEnabled()) {
+        return;
+    }
+    const std::wstring formatted = formatTextServiceDebugLogLine(message);
     ::OutputDebugStringW((formatted + L"\n").c_str());
     appendTextServiceDebugLog(formatted);
 }
