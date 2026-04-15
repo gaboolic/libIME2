@@ -4,6 +4,7 @@
 namespace Ime {
 
 bool isDebugLoggingEnabled();
+bool isTraceLoggingEnabled();
 
 } // namespace Ime
 

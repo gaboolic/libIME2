@@ -10,6 +10,12 @@ namespace Ime {
 
 namespace {
 
+enum class DebugLogLevel {
+    Off,
+    Debug,
+    Trace,
+};
+
 std::wstring configFilePath() {
     const wchar_t* localAppData = _wgetenv(L"LOCALAPPDATA");
     if (!localAppData || !*localAppData) {
@@ -39,7 +45,7 @@ bool readFileText(const std::wstring& path, std::string* out) {
     return true;
 }
 
-bool parseDebugEnabled(const std::string& raw) {
+DebugLogLevel parseDebugLogLevel(const std::string& raw) {
     std::string text = raw;
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
         return static_cast<char>(std::tolower(ch));
@@ -47,47 +53,72 @@ bool parseDebugEnabled(const std::string& raw) {
 
     const size_t keyPos = text.find("\"loglevel\"");
     if (keyPos == std::string::npos) {
-        return false;
+        return DebugLogLevel::Off;
     }
 
     const size_t colonPos = text.find(':', keyPos);
     if (colonPos == std::string::npos) {
-        return false;
+        return DebugLogLevel::Off;
     }
 
     const size_t firstQuote = text.find('"', colonPos);
     if (firstQuote == std::string::npos) {
-        return false;
+        return DebugLogLevel::Off;
     }
 
     const size_t secondQuote = text.find('"', firstQuote + 1);
     if (secondQuote == std::string::npos) {
-        return false;
+        return DebugLogLevel::Off;
     }
 
     const std::string value = text.substr(firstQuote + 1, secondQuote - firstQuote - 1);
-    return value == "debug" || value == "trace";
+    if (value == "trace") {
+        return DebugLogLevel::Trace;
+    }
+    if (value == "debug") {
+        return DebugLogLevel::Debug;
+    }
+    return DebugLogLevel::Off;
 }
 
 } // namespace
 
 bool isDebugLoggingEnabled() {
     static ULONGLONG lastRefreshTick = 0;
-    static bool cachedEnabled = false;
+    static DebugLogLevel cachedLevel = DebugLogLevel::Off;
 
     const ULONGLONG now = ::GetTickCount64();
     if (lastRefreshTick != 0 && now - lastRefreshTick < 1000) {
-        return cachedEnabled;
+        return cachedLevel >= DebugLogLevel::Debug;
     }
 
-    cachedEnabled = false;
+    cachedLevel = DebugLogLevel::Off;
     std::string configText;
     if (readFileText(configFilePath(), &configText)) {
-        cachedEnabled = parseDebugEnabled(configText);
+        cachedLevel = parseDebugLogLevel(configText);
     }
 
     lastRefreshTick = now;
-    return cachedEnabled;
+    return cachedLevel >= DebugLogLevel::Debug;
+}
+
+bool isTraceLoggingEnabled() {
+    static ULONGLONG lastRefreshTick = 0;
+    static DebugLogLevel cachedLevel = DebugLogLevel::Off;
+
+    const ULONGLONG now = ::GetTickCount64();
+    if (lastRefreshTick != 0 && now - lastRefreshTick < 1000) {
+        return cachedLevel >= DebugLogLevel::Trace;
+    }
+
+    cachedLevel = DebugLogLevel::Off;
+    std::string configText;
+    if (readFileText(configFilePath(), &configText)) {
+        cachedLevel = parseDebugLogLevel(configText);
+    }
+
+    lastRefreshTick = now;
+    return cachedLevel >= DebugLogLevel::Trace;
 }
 
 } // namespace Ime

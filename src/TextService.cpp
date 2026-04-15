@@ -85,7 +85,7 @@ std::wstring formatTextServiceDebugLogLine(const std::wstring& message) {
 }
 
 void appendTextServiceDebugLog(const std::wstring& message) {
-    if (!isDebugLoggingEnabled()) {
+    if (!isTraceLoggingEnabled()) {
         return;
     }
 
@@ -109,7 +109,7 @@ void appendTextServiceDebugLog(const std::wstring& message) {
 }
 
 void logTextServiceDebug(const std::wstring& message) {
-    if (!isDebugLoggingEnabled()) {
+    if (!isTraceLoggingEnabled()) {
         return;
     }
     const std::wstring formatted = formatTextServiceDebugLogLine(message);
