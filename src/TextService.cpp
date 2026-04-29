@@ -390,7 +390,7 @@ void TextService::startComposition(ITfContext* context) {
         [=](EditSession* session, TfEditCookie cookie) {
             if (auto contextComposition = ComPtr<ITfContextComposition>::queryFrom(context)) {
                 const bool inlinePreeditEnabled = inlinePreeditEnabledForComposition();
-                const bool useDummyAnchor = effectiveDummyCompositionAnchor();
+                const bool useDummyAnchor = !inlinePreeditEnabled || effectiveDummyCompositionAnchor();
                 // get current insertion point in the current context
                 ComPtr<ITfRange> range;
                 if (auto insertAtSelection = ComPtr<ITfInsertAtSelection>::queryFrom(context)) {
@@ -408,11 +408,10 @@ void TextService::startComposition(ITfContext* context) {
                         }
 
                         if (useDummyAnchor && compositionRange) {
-                            // Some CUAS-backed hosts do not provide a useful
-                            // GetTextExt() anchor until the composition contains
-                            // at least one character. Use an actual zero-width
-                            // space so the host gets an anchor without showing a
-                            // visible placeholder in the app.
+                            // Some hosts do not provide a useful GetTextExt()
+                            // anchor until the composition contains at least one
+                            // character. Use a zero-width placeholder so the host
+                            // creates an anchor without visible inline preedit.
                             if (compositionRange->SetText(
                                     cookie, TF_ST_CORRECTION, kDummyAnchorText, 1) == S_OK) {
                                 dummyCompositionActive_ = true;
@@ -532,8 +531,7 @@ void TextService::setCompositionString(EditSession* session, const wchar_t* str,
                 bool selPosInComposition = true;
                 // if current insertion point is not covered by composition, we cannot insert text here.
                 if(selPosInComposition) {
-                    const bool preserveDummyAnchor =
-                        dummyCompositionActive_ && effectiveDummyCompositionAnchor() && len == 0;
+                    const bool preserveDummyAnchor = dummyCompositionActive_ && len == 0;
 
                     // replace context of composion area with the new string.
                     if (!preserveDummyAnchor) {
@@ -850,6 +848,9 @@ void TextService::onLangProfileActivated(REFGUID guidProfile) {
 void TextService::onLangProfileDeactivated(REFGUID guidProfile) {
 }
 
+void TextService::onLayoutChange(ITfContext* context, TfLayoutCode code, ITfContextView* view) {
+}
+
 void TextService::initKeyboardState() {
     // get current keyboard state
     isKeyboardOpened_ = threadCompartmentValue(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) != 0;
@@ -862,11 +863,10 @@ void TextService::initKeyboardState() {
 }
 
 void TextService::installEventListeners() {
-    // ITfThreadMgrEventSink, ITfActiveLanguageProfileNotifySink, and ITfTextEditSink
+    // ITfThreadMgrEventSink, ITfActiveLanguageProfileNotifySink, and ITfThreadFocusSink
     if (auto source = threadMgr_.query<ITfSource>()) {
         threadMgrEventSink_ = SinkAdvice{ source, IID_ITfThreadMgrEventSink, static_cast<ITfThreadMgrEventSink*>(this) };
         activateLanguageProfileNotifySink_ = SinkAdvice{ source, IID_ITfActiveLanguageProfileNotifySink, static_cast<ITfActiveLanguageProfileNotifySink*>(this) };
-        textEditSink_ = SinkAdvice{ source, IID_ITfTextEditSink, static_cast<ITfTextEditSink*>(this) };
         threadFocusSink_ = SinkAdvice{ source, IID_ITfThreadFocusSink, static_cast<ITfThreadFocusSink*>(this) };
     }
 
@@ -884,13 +884,20 @@ void TextService::installEventListeners() {
     if (auto source = threadCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE).query<ITfSource>()) {
         keyboardOPenCloseSink_ = SinkAdvice(source, IID_ITfCompartmentEventSink, (ITfCompartmentEventSink*)this);
     }
+
+    ComPtr<ITfDocumentMgr> documentMgr;
+    if (threadMgr_ && threadMgr_->GetFocus(&documentMgr) == S_OK) {
+        initTextEditSink(documentMgr);
+    }
 }
 
 void TextService::uninstallEventListeners() {
-    // ITfThreadMgrEventSink, ITfActiveLanguageProfileNotifySink, and ITfTextEditSink
+    // ITfThreadMgrEventSink, ITfActiveLanguageProfileNotifySink, and ITfThreadFocusSink
     threadMgrEventSink_.unadvise();
     activateLanguageProfileNotifySink_.unadvise();
     textEditSink_.unadvise();
+    textLayoutSink_.unadvise();
+    textEditSinkContext_ = nullptr;
     threadFocusSink_.unadvise();
 
     // ITfKeyEventSink
@@ -904,6 +911,27 @@ void TextService::uninstallEventListeners() {
 
     // Keyboard open status change.
     keyboardOPenCloseSink_.unadvise();
+}
+
+void TextService::initTextEditSink(ITfDocumentMgr* documentMgr) {
+    textEditSink_.unadvise();
+    textLayoutSink_.unadvise();
+    textEditSinkContext_ = nullptr;
+
+    if (!documentMgr) {
+        return;
+    }
+
+    ComPtr<ITfContext> context;
+    if (documentMgr->GetTop(&context) != S_OK || !context) {
+        return;
+    }
+
+    if (auto source = context.query<ITfSource>()) {
+        textEditSink_ = SinkAdvice{ source, IID_ITfTextEditSink, static_cast<ITfTextEditSink*>(this) };
+        textLayoutSink_ = SinkAdvice{ source, IID_ITfTextLayoutSink, static_cast<ITfTextLayoutSink*>(this) };
+        textEditSinkContext_ = context;
+    }
 }
 
 void TextService::activateLanguageButtons() {
@@ -1003,6 +1031,7 @@ STDMETHODIMP TextService::OnUninitDocumentMgr(ITfDocumentMgr *pDocMgr) {
 }
 
 STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pDocMgrFocus, ITfDocumentMgr *pDocMgrPrevFocus) {
+    initTextEditSink(pDocMgrFocus);
     return S_OK;
 }
 
@@ -1053,6 +1082,14 @@ STDMETHODIMP TextService::OnEndEdit(ITfContext *pContext, TfEditCookie ecReadOnl
         }
     }
 
+    return S_OK;
+}
+
+STDMETHODIMP TextService::OnLayoutChange(ITfContext *pContext, TfLayoutCode lcode, ITfContextView *pContextView) {
+    if (pContext != textEditSinkContext_) {
+        return S_OK;
+    }
+    onLayoutChange(pContext, lcode, pContextView);
     return S_OK;
 }
 

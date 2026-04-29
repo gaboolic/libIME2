@@ -52,6 +52,7 @@ class TextService:
         // event sinks
         ComInterface<ITfThreadMgrEventSink>,
         ComInterface<ITfTextEditSink>,
+        ComInterface<ITfTextLayoutSink>,
         ComInterface<ITfKeyEventSink>,
         ComInterface<ITfCompositionSink>,
         ComInterface<ITfThreadFocusSink>,
@@ -202,6 +203,9 @@ public:
     // called when a language profile is deactivated
     virtual void onLangProfileDeactivated(REFGUID guidProfile);
 
+    // called when TSF reports that the current context layout changed.
+    virtual void onLayoutChange(ITfContext* context, TfLayoutCode code, ITfContextView* view);
+
     // Derived text services can override this when they render the preedit
     // outside the application and want TSF to expose an inline composition.
     virtual bool inlinePreeditEnabledForComposition() const;
@@ -234,6 +238,9 @@ public:
 
     // ITfTextEditSink
     STDMETHODIMP OnEndEdit(ITfContext *pContext, TfEditCookie ecReadOnly, ITfEditRecord *pEditRecord) override;
+
+    // ITfTextLayoutSink
+    STDMETHODIMP OnLayoutChange(ITfContext *pContext, TfLayoutCode lcode, ITfContextView *pContextView) override;
 
     // ITfKeyEventSink
     STDMETHODIMP OnSetFocus(BOOL fForeground) override;
@@ -274,6 +281,7 @@ protected:
 
     void installEventListeners();
     void uninstallEventListeners();
+    void initTextEditSink(ITfDocumentMgr* documentMgr);
 
     void activateLanguageButtons();
     void deactivateLanguageButtons();
@@ -299,8 +307,11 @@ private:
     SinkAdvice activateLanguageProfileNotifySink_;
     SinkAdvice keyboardOPenCloseSink_;
     SinkAdvice textEditSink_;
+    SinkAdvice textLayoutSink_;
     SinkAdvice threadFocusSink_;
     DWORD langBarSinkCookie_;
+
+    ComPtr<ITfContext> textEditSinkContext_;
 
     ComPtr<ITfComposition> composition_; // acquired when starting composition, released when ending composition
     mutable bool dummyCompositionActive_;
